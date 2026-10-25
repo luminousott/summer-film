@@ -73,7 +73,7 @@ jobs:
             const from=(a/fps).toFixed(4), to=(b/fps).toFixed(4);
             console.log("range", from, to);
             require("child_process").execSync(
-              `node render.mjs --frames --range=${from}:${to} --workers=${process.env.W}`,
+              `node render.mjs --frames --range=${from}:${to} --workers=${process.env.W} --soft-gl`,
               {stdio:"inherit"}
             );
           '
