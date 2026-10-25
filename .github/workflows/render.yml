@@ -1,0 +1,115 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "number of shards (matrix width)"
+        required: false
+        default: "8"
+      workers:
+        description: "browser pages per shard"
+        required: false
+        default: "2"
+      crf:
+        description: "x264 quality (lower = better)"
+        required: false
+        default: "20"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          node -e '
+            const fs=require("fs");
+            const cfg=fs.readFileSync("src/config.js","utf8");
+            const dur=parseFloat(cfg.match(/duration:\s*([\d.]+)/)[1]);
+            const fps=24;
+            const total=Math.round(dur*fps);
+            const n=parseInt(process.env.SHARDS||"8",10);
+            const step=Math.ceil(total/n);
+            const parts=[];
+            for(let i=0;i<n;i++){
+              const a=i*step, b=Math.min(total,(i+1)*step);
+              if(a>=b) continue;
+              parts.push({shard:i,a,b});
+            }
+            fs.writeFileSync("shards.json", JSON.stringify(parts));
+            console.log(JSON.stringify(parts));
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,"matrix="+JSON.stringify({include:parts})+"\n");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,"total="+total+"\n");
+          '
+        env:
+          SHARDS: ${{ inputs.shards }}
+
+  render:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - name: render frames for this shard
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          A: ${{ matrix.a }}
+          B: ${{ matrix.b }}
+          W: ${{ inputs.workers }}
+        run: |
+          node -e '
+            const a=+process.env.A, b=+process.env.B, fps=24;
+            const from=(a/fps).toFixed(4), to=(b/fps).toFixed(4);
+            console.log("range", from, to);
+            require("child_process").execSync(
+              `node render.mjs --frames --range=${from}:${to} --workers=${process.env.W}`,
+              {stdio:"inherit"}
+            );
+          '
+      - name: encode shard to mp4
+        env:
+          A: ${{ matrix.a }}
+          CRF: ${{ inputs.crf }}
+        run: |
+          ffmpeg -hide_banner -loglevel error -framerate 24 -start_number "$A" \
+            -i out/frames/f%05d.jpg -c:v libx264 -preset medium -crf "$CRF" \
+            -pix_fmt yuv420p -r 24 "chunk_${{ matrix.shard }}.mp4"
+          ls -lh chunk_${{ matrix.shard }}.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.shard }}
+          path: chunk_${{ matrix.shard }}.mp4
+          retention-days: 3
+
+  join:
+    needs: [setup, render]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: chunks
+          pattern: chunk-*
+      - name: concat
+        run: |
+          ls -R chunks | head -40
+          : > list.txt
+          for f in $(ls -v chunks/chunk-*/chunk_*.mp4); do echo "file '$PWD/$f'" >> list.txt; done
+          cat list.txt
+          ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i list.txt -c copy final.mp4
+          ffprobe -v error -show_entries format=duration,size -of default=nw=1 final.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-film
+          path: final.mp4
+          retention-days: 7
